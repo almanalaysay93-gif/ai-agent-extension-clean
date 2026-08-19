@@ -3,8 +3,24 @@
  * worker (the brain) and the Content Script (the eyes & hands).
  */
 
+/**
+ * A file the user attached in the composer. Images and PDFs travel to the
+ * model as multimodal content parts; everything else is read as text in the
+ * panel and inlined, which works on every model and costs nothing extra.
+ */
+export type Attachment = {
+  name: string;
+  mimeType: string;
+  size: number;
+  kind: 'image' | 'pdf' | 'text';
+  /** Data URL — set for image and pdf attachments. */
+  dataUrl?: string;
+  /** Decoded file text — set for text attachments. */
+  text?: string;
+};
+
 export type SidePanelRequest =
-  | { type: 'SEND_MESSAGE'; payload: { text: string } }
+  | { type: 'SEND_MESSAGE'; payload: { text: string; attachments?: Attachment[] } }
   | { type: 'STOP' }
   | { type: 'GET_PAGE_CONTEXT' }
   | { type: 'CLEAR_HISTORY' };

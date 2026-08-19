@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AlAi Agent — microphone access</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: #faf9f7;
+        color: #1f2937;
+      }
+      main { max-width: 34rem; padding: 2.5rem; }
+      h1 { font-size: 1.35rem; margin: 0 0 0.75rem; }
+      p { margin: 0 0 1rem; color: #4b5563; }
+      #status { font-weight: 600; }
+      .ok { color: #15803d; }
+      .bad { color: #b91c1c; }
+      button {
+        font: inherit;
+        padding: 0.55rem 1.1rem;
+        border-radius: 0.55rem;
+        border: 1px solid #d4d4d0;
+        background: #fff;
+        cursor: pointer;
+      }
+      button:hover { background: #f3f4f6; }
+      @media (prefers-color-scheme: dark) {
+        body { background: #17171a; color: #e5e7eb; }
+        p { color: #9ca3af; }
+        button { background: #232327; border-color: #3f3f46; color: inherit; }
+        button:hover { background: #2c2c31; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Microphone access for voice input</h1>
+      <p>
+        Chrome will not show its microphone prompt inside a side panel, so the
+        grant is collected here instead. Allow the microphone once and voice
+        input works in the panel from then on.
+      </p>
+      <p id="status">Requesting the microphone…</p>
+      <button id="retry" hidden>Ask again</button>
+    </main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

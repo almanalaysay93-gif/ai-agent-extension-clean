@@ -22,6 +22,7 @@ export default defineConfig({
         sidepanel: 'sidepanel/index.html',
         options: 'options/index.html',
         offscreen: 'offscreen/index.html',
+        permission: 'permission/index.html',
       },
     },
   },

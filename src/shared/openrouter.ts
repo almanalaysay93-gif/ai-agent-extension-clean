@@ -5,11 +5,30 @@
 
 export const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
+/**
+ * Multimodal content parts, per the OpenRouter chat-completions schema.
+ * A message either carries plain text or an ordered array of parts.
+ */
+export type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+  | { type: 'file'; file: { filename: string; file_data: string } };
+
 export type ChatMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
+  content: string | ContentPart[];
   tool_call_id?: string;
   name?: string;
+};
+
+/**
+ * OpenRouter plugin declarations sent alongside a request. Only used for the
+ * file parser today: PDFs are extracted with the free "pdf-text" engine
+ * unless the caller asks for OCR.
+ */
+export type OpenRouterPlugin = {
+  id: string;
+  pdf?: { engine: 'pdf-text' | 'mistral-ocr' | 'native' };
 };
 
 export type ToolCall = {
@@ -23,6 +42,18 @@ export type AssistantChunk = {
   toolCalls?: ToolCall[];
   stopReason?: string | null;
 };
+
+/**
+ * Flattens a message's content to plain text. Assistant replies always come
+ * back as a string, but the type allows parts, so narrow in one place.
+ */
+export function contentToText(content: string | ContentPart[]): string {
+  if (typeof content === 'string') return content;
+  return content
+    .map((part) => (part.type === 'text' ? part.text : ''))
+    .filter(Boolean)
+    .join('\n');
+}
 
 function validateKey(apiKey: string): void {
   if (!apiKey || apiKey.trim().length === 0) {
@@ -41,6 +72,7 @@ export async function chatCompletion(
   messages: ChatMessage[],
   onDelta: (delta: string) => void,
   signal?: AbortSignal,
+  plugins?: OpenRouterPlugin[],
 ): Promise<{ text: string; stopReason: string | null }> {
   validateKey(apiKey);
 
@@ -57,6 +89,7 @@ export async function chatCompletion(
       model,
       messages,
       stream: true,
+      ...(plugins && plugins.length > 0 ? { plugins } : {}),
     }),
   });
 
@@ -80,6 +113,7 @@ export async function chatCompletionWithTools(
   messages: ChatMessage[],
   tools: object[],
   signal?: AbortSignal,
+  plugins?: OpenRouterPlugin[],
 ): Promise<{ message: ChatMessage; stopReason: string | null }> {
   validateKey(apiKey);
 
@@ -97,6 +131,7 @@ export async function chatCompletionWithTools(
       messages,
       tools,
       stream: false,
+      ...(plugins && plugins.length > 0 ? { plugins } : {}),
     }),
   });
 

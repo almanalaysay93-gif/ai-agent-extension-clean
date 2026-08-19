@@ -3,18 +3,29 @@ import {
   AlertTriangle,
   ArrowUp,
   Bot,
+  FileText,
+  Image as ImageIcon,
   Loader2,
+  Mic,
+  Paperclip,
   Plus,
   RefreshCw,
   Settings,
   Sparkles,
   Square,
   Trash2,
+  X,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import ModelSelector from './components/ModelSelector';
-import type { SidePanelEvent, SidePanelRequest } from '../src/shared/messages';
+import type {
+  Attachment,
+  SidePanelEvent,
+  SidePanelRequest,
+} from '../src/shared/messages';
+import { formatSize, readAttachment, MAX_ATTACHMENTS } from './attachments';
+import { createDictation, type Dictation } from './dictation';
 
 type Message = {
   role: 'user' | 'assistant';
@@ -52,13 +63,79 @@ function App() {
     url: string;
   } | null>(null);
   const [fetchingContext, setFetchingContext] = useState(false);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [listening, setListening] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const draftRef = useRef('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const dictationRef = useRef<Dictation | null>(null);
+  // Text that was already committed when dictation started, so interim
+  // results replace each other instead of stacking up in the box.
+  const dictationBaseRef = useRef('');
 
   useEffect(() => {
     draftRef.current = input;
   }, [input]);
+
+  const setDraft = useCallback((text: string) => {
+    setInput(text);
+    draftRef.current = text;
+  }, []);
+
+  const addFiles = useCallback(
+    async (files: FileList | File[]) => {
+      const picked = [...files];
+      if (picked.length === 0) return;
+      const room = MAX_ATTACHMENTS - attachments.length;
+      if (room <= 0) {
+        setError(`You can attach at most ${MAX_ATTACHMENTS} files per message.`);
+        return;
+      }
+      const accepted: Attachment[] = [];
+      for (const file of picked.slice(0, room)) {
+        try {
+          accepted.push(await readAttachment(file));
+        } catch (err) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      }
+      if (accepted.length > 0) {
+        setAttachments((current) => [...current, ...accepted]);
+      }
+    },
+    [attachments.length],
+  );
+
+  const removeAttachment = (index: number) =>
+    setAttachments((current) => current.filter((_, i) => i !== index));
+
+  const toggleDictation = () => {
+    if (!dictationRef.current) {
+      dictationRef.current = createDictation({
+        onTranscript: (text, isFinal) => {
+          const base = dictationBaseRef.current;
+          const joined = base ? `${base} ${text}` : text;
+          setDraft(joined);
+          if (isFinal) dictationBaseRef.current = joined;
+        },
+        onError: (message) => setError(message),
+        onListeningChange: setListening,
+      });
+    }
+    const dictation = dictationRef.current;
+    if (!dictation.supported) {
+      setError('This browser has no speech recognition support.');
+      return;
+    }
+    if (dictation.listening()) {
+      dictation.stop();
+      return;
+    }
+    setError(null);
+    dictationBaseRef.current = draftRef.current.trim();
+    void dictation.start();
+  };
 
   const scrollToBottom = useCallback(() => {
     scrollRef.current?.scrollTo({
@@ -166,10 +243,16 @@ function App() {
   const handleSubmit = (e?: React.FormEvent, overrideText?: string) => {
     if (e) e.preventDefault();
     const text = (overrideText ?? draftRef.current).trim();
-    if (!text || busy) return;
-    setInput('');
+    if ((!text && attachments.length === 0) || busy) return;
+    if (listening) dictationRef.current?.stop();
+    setDraft('');
+    dictationBaseRef.current = '';
     setError(null);
-    send({ type: 'SEND_MESSAGE', payload: { text } });
+    send({
+      type: 'SEND_MESSAGE',
+      payload: { text, ...(attachments.length > 0 ? { attachments } : {}) },
+    });
+    setAttachments([]);
   };
 
   const handleStop = () => send({ type: 'STOP' });
@@ -380,10 +463,75 @@ function App() {
             }}
           />
         </div>
+        {attachments.length > 0 && (
+          <div className="ms-attachments">
+            {attachments.map((file, index) => (
+              <div className="ms-attach-chip" key={`${file.name}-${index}`}>
+                {file.kind === 'image' ? (
+                  <ImageIcon className="h-3 w-3 shrink-0" />
+                ) : (
+                  <FileText className="h-3 w-3 shrink-0" />
+                )}
+                <span className="ms-attach-chip-name" title={file.name}>
+                  {file.name}
+                </span>
+                <span className="ms-attach-chip-size">{formatSize(file.size)}</span>
+                <button
+                  type="button"
+                  className="ms-attach-chip-remove"
+                  onClick={() => removeAttachment(index)}
+                  title={`Remove ${file.name}`}
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept="image/*,application/pdf,text/*,.md,.csv,.json,.yaml,.yml,.srt,.vtt,.log"
+          style={{ display: 'none' }}
+          onChange={(e) => {
+            if (e.target.files) void addFiles(e.target.files);
+            e.target.value = '';
+          }}
+        />
         <form onSubmit={handleSubmit} style={{ display: 'contents' }}>
           <div className="ms-composer">
+            <button
+              type="button"
+              className="ms-icon-btn"
+              onClick={() => fileInputRef.current?.click()}
+              title="Attach images, PDFs, or text files"
+            >
+              <Paperclip className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              className={`ms-icon-btn ${listening ? 'ms-icon-btn-active' : ''}`}
+              onClick={toggleDictation}
+              title={listening ? 'Stop dictation' : 'Dictate a message'}
+            >
+              <Mic className="h-3.5 w-3.5" />
+            </button>
             <textarea
               value={input}
+              onPaste={(e) => {
+                const files = [...e.clipboardData.files];
+                if (files.length > 0) {
+                  e.preventDefault();
+                  void addFiles(files);
+                }
+              }}
+              onDrop={(e) => {
+                if (e.dataTransfer.files.length > 0) {
+                  e.preventDefault();
+                  void addFiles(e.dataTransfer.files);
+                }
+              }}
               onChange={(e) => {
                 setInput(e.target.value);
                 // Auto-grow: expand to fit the text, capped by CSS max-height.
@@ -413,7 +561,7 @@ function App() {
             ) : (
               <button
                 type="submit"
-                disabled={!input.trim()}
+                disabled={!input.trim() && attachments.length === 0}
                 className="ms-send-btn"
                 title="Send"
               >

@@ -12,11 +12,15 @@
 import {
   chatCompletion,
   chatCompletionWithTools,
+  contentToText,
   type ChatMessage,
+  type ContentPart,
+  type OpenRouterPlugin,
   type ToolCall,
 } from '../shared/openrouter';
 import { getEnabledSkillInstructions, getSettings } from '../shared/storage';
 import type {
+  Attachment,
   ContentScriptRequest,
   ContentScriptResponse,
   SidePanelEvent,
@@ -826,12 +830,72 @@ async function buildAndDownloadPptx(
 }
 
 /* ------------------------------------------------------------------ */
+/* Attachments                                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Turns the composer's attachments into OpenRouter content parts.
+ *
+ * Images and PDFs go up as native multimodal parts. Text-like files are
+ * inlined as fenced blocks instead: that works on every model, needs no
+ * parser plugin, and costs nothing beyond the tokens themselves.
+ */
+function buildUserContent(text: string, attachments: Attachment[]): string | ContentPart[] {
+  if (attachments.length === 0) return text;
+
+  const parts: ContentPart[] = [];
+  const inlined: string[] = [];
+
+  for (const file of attachments) {
+    if (file.kind === 'text' && file.text) {
+      inlined.push(
+        ['### Attached file: ' + file.name, '', '```', file.text, '```'].join('\n'),
+      );
+    }
+  }
+
+  const prompt = inlined.length > 0 ? [text, ...inlined].join('\n\n') : text;
+  parts.push({ type: 'text', text: prompt });
+
+  for (const file of attachments) {
+    if (file.kind === 'image' && file.dataUrl) {
+      parts.push({ type: 'image_url', image_url: { url: file.dataUrl } });
+    } else if (file.kind === 'pdf' && file.dataUrl) {
+      parts.push({
+        type: 'file',
+        file: { filename: file.name, file_data: file.dataUrl },
+      });
+    }
+  }
+
+  return parts;
+}
+
+/**
+ * PDFs need OpenRouter's file parser. "pdf-text" is the free engine and
+ * handles ordinary text PDFs; scanned documents need the paid OCR engine,
+ * which the user opts into on the Options page.
+ */
+async function pluginsForAttachments(
+  attachments: Attachment[],
+): Promise<OpenRouterPlugin[] | undefined> {
+  if (!attachments.some((file) => file.kind === 'pdf')) return undefined;
+  const stored = await chrome.storage.local.get('pdf_ocr_engine');
+  const engine = stored['pdf_ocr_engine'] === 'mistral-ocr' ? 'mistral-ocr' : 'pdf-text';
+  return [{ id: 'file-parser', pdf: { engine } }];
+}
+
+/* ------------------------------------------------------------------ */
 /* Agentic tool-calling loop                                           */
 /* ------------------------------------------------------------------ */
 
 const MAX_TOOL_STEPS = 10;
 
-async function runAgentLoop(tabId: number, notify: (event: SidePanelEvent) => void): Promise<void> {
+async function runAgentLoop(
+  tabId: number,
+  notify: (event: SidePanelEvent) => void,
+  plugins?: OpenRouterPlugin[],
+): Promise<void> {
   const { apiKey, model } = await getSettings();
 
   const messages: ChatMessage[] = [
@@ -865,6 +929,7 @@ async function runAgentLoop(tabId: number, notify: (event: SidePanelEvent) => vo
       messages,
       AGENT_TOOLS,
       abortController?.signal,
+      plugins,
     );
 
     messages.push(message);
@@ -875,7 +940,10 @@ async function runAgentLoop(tabId: number, notify: (event: SidePanelEvent) => vo
     if (!toolCalls || toolCalls.length === 0) {
       // No more tool calls — stream the final answer.
       if (message.content) {
-        notify({ type: 'MESSAGE_COMPLETE', payload: { role: 'assistant', text: message.content } });
+        notify({
+          type: 'MESSAGE_COMPLETE',
+          payload: { role: 'assistant', text: contentToText(message.content) },
+        });
       }
       return;
     }
@@ -916,7 +984,10 @@ async function runAgentLoop(tabId: number, notify: (event: SidePanelEvent) => vo
 
     // Reached a stop without tool calls; emit whatever content exists.
     if (message.content) {
-      notify({ type: 'MESSAGE_COMPLETE', payload: { role: 'assistant', text: message.content } });
+      notify({
+        type: 'MESSAGE_COMPLETE',
+        payload: { role: 'assistant', text: contentToText(message.content) },
+      });
     }
     return;
   }
@@ -932,6 +1003,7 @@ async function runAgentLoop(tabId: number, notify: (event: SidePanelEvent) => vo
     messages,
     (delta) => notify({ type: 'ROLE_DELTA', payload: { role: 'assistant', delta } }),
     abortController?.signal,
+    plugins,
   );
   if (text) {
     notify({ type: 'MESSAGE_COMPLETE', payload: { role: 'assistant', text } });
@@ -1052,10 +1124,21 @@ async function handleSidePanelMessage(request: SidePanelRequest): Promise<void> 
       }
 
       const userText = request.payload.text.trim();
-      if (!userText) return;
+      const attachments = request.payload.attachments ?? [];
+      if (!userText && attachments.length === 0) return;
 
-      conversation.push({ role: 'user', content: userText });
-      notify({ type: 'MESSAGE_COMPLETE', payload: { role: 'user', text: userText } });
+      conversation.push({
+        role: 'user',
+        content: buildUserContent(userText, attachments),
+      });
+      const attachmentNote =
+        attachments.length > 0
+          ? '\n\n_Attached: ' + attachments.map((file) => file.name).join(', ') + '_'
+          : '';
+      notify({
+        type: 'MESSAGE_COMPLETE',
+        payload: { role: 'user', text: `${userText}${attachmentNote}` },
+      });
 
       // Let the user see activity immediately; the page read then runs
       // within a bounded budget so a slow page never freezes the panel.
@@ -1078,7 +1161,7 @@ async function handleSidePanelMessage(request: SidePanelRequest): Promise<void> 
         }
       }
 
-      await runAgentLoop(tab.id, notify);
+      await runAgentLoop(tab.id, notify, await pluginsForAttachments(attachments));
     }
   } catch (error) {
     const message =
