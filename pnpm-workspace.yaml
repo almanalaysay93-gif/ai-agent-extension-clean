@@ -1,0 +1,3 @@
+onlyBuiltDependenciesFile: /dev/null
+allowBuilds:
+  esbuild: true
