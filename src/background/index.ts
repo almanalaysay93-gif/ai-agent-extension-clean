@@ -1143,8 +1143,6 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 chrome.runtime.onInstalled.addListener(async () => {
   console.log('AlAi Agent extension installed.');
-  // Pre-configure default settings so the extension works out of the box.
-  // Users can change these at any time on the Options page or Side Panel.
   // Seed the model choice only. The API key stays empty until the user
   // enters their own on the Options page.
   const existing = await chrome.storage.local.get([
