@@ -855,7 +855,11 @@ function buildUserContent(text: string, attachments: Attachment[]): string | Con
   }
 
   const prompt = inlined.length > 0 ? [text, ...inlined].join('\n\n') : text;
-  parts.push({ type: 'text', text: prompt });
+  // An empty text part is rejected by some providers, so only send one when
+  // there is something to say. Attachments alone are a valid message.
+  if (prompt.trim().length > 0) {
+    parts.push({ type: 'text', text: prompt });
+  }
 
   for (const file of attachments) {
     if (file.kind === 'image' && file.dataUrl) {
@@ -872,14 +876,51 @@ function buildUserContent(text: string, attachments: Attachment[]): string | Con
 }
 
 /**
- * PDFs need OpenRouter's file parser. "pdf-text" is the free engine and
- * handles ordinary text PDFs; scanned documents need the paid OCR engine,
- * which the user opts into on the Options page.
+ * A history-safe stand-in for a message that carried attachments.
+ *
+ * Base64 images and PDFs must not linger in the conversation: they would be
+ * re-uploaded on every later turn, and OpenRouter re-parses any file part it
+ * sees — on the paid OCR engine when no plugin is declared. The turn that
+ * carried the files gets the real parts; every turn after it gets this note.
  */
-async function pluginsForAttachments(
-  attachments: Attachment[],
+function compactUserContent(text: string, attachments: Attachment[]): string {
+  if (attachments.length === 0) return text;
+  const names = attachments
+    .map((file) => `${file.name} (${file.kind}${file.truncated ? ', shortened' : ''})`)
+    .join(', ');
+  const inlined = attachments
+    .filter((file) => file.kind === 'text' && file.text)
+    .map((file) =>
+      ['### Attached file: ' + file.name, '', '```', file.text, '```'].join('\n'),
+    );
+  return [
+    text,
+    ...inlined,
+    `[Attached earlier in this conversation: ${names}. The file contents were sent with that message.]`,
+  ]
+    .filter((chunk) => chunk && chunk.length > 0)
+    .join('\n\n');
+}
+
+/**
+ * PDFs need OpenRouter's file parser. "pdf-text" is the free engine and
+ * handles ordinary text PDFs; "mistral-ocr" is the paid engine for scans,
+ * opted into by setting pdf_ocr_engine in extension storage.
+ *
+ * The engine is derived from the messages actually being sent, not from what
+ * the user just attached: OpenRouter parses any file part in the request, and
+ * an undeclared engine bills as OCR, so every request that carries a file
+ * part must name one.
+ */
+async function pluginsForMessages(
+  messages: ChatMessage[],
 ): Promise<OpenRouterPlugin[] | undefined> {
-  if (!attachments.some((file) => file.kind === 'pdf')) return undefined;
+  const carriesFile = messages.some(
+    (message) =>
+      Array.isArray(message.content) &&
+      message.content.some((part) => part.type === 'file'),
+  );
+  if (!carriesFile) return undefined;
   const stored = await chrome.storage.local.get('pdf_ocr_engine');
   const engine = stored['pdf_ocr_engine'] === 'mistral-ocr' ? 'mistral-ocr' : 'pdf-text';
   return [{ id: 'file-parser', pdf: { engine } }];
@@ -894,7 +935,6 @@ const MAX_TOOL_STEPS = 10;
 async function runAgentLoop(
   tabId: number,
   notify: (event: SidePanelEvent) => void,
-  plugins?: OpenRouterPlugin[],
 ): Promise<void> {
   const { apiKey, model } = await getSettings();
 
@@ -902,6 +942,10 @@ async function runAgentLoop(
     { role: 'system', content: AGENT_SYSTEM_PROMPT },
     ...conversation.slice(-MAX_HISTORY),
   ];
+
+  // Derived from the request itself, so a file part can never travel without
+  // a declared parser engine.
+  const plugins = await pluginsForMessages(messages);
 
   // Mechanically cap get_page_context failures within this run: the model
   // sometimes ignores the "retry once" instruction, so enforce it in code to
@@ -1127,10 +1171,11 @@ async function handleSidePanelMessage(request: SidePanelRequest): Promise<void> 
       const attachments = request.payload.attachments ?? [];
       if (!userText && attachments.length === 0) return;
 
-      conversation.push({
+      const attachmentEntry: ChatMessage = {
         role: 'user',
         content: buildUserContent(userText, attachments),
-      });
+      };
+      conversation.push(attachmentEntry);
       const attachmentNote =
         attachments.length > 0
           ? '\n\n_Attached: ' + attachments.map((file) => file.name).join(', ') + '_'
@@ -1161,7 +1206,14 @@ async function handleSidePanelMessage(request: SidePanelRequest): Promise<void> 
         }
       }
 
-      await runAgentLoop(tab.id, notify, await pluginsForAttachments(attachments));
+      try {
+        await runAgentLoop(tab.id, notify);
+      } finally {
+        // Collapse the attachment payload once this turn is answered. Leaving
+        // the base64 in history would re-upload it, and re-parse the PDF, on
+        // every later turn.
+        attachmentEntry.content = compactUserContent(userText, attachments);
+      }
     }
   } catch (error) {
     const message =

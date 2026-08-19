@@ -17,6 +17,8 @@ export type Attachment = {
   dataUrl?: string;
   /** Decoded file text — set for text attachments. */
   text?: string;
+  /** True when the panel shrank an image or clipped a long text file. */
+  truncated?: boolean;
 };
 
 export type SidePanelRequest =

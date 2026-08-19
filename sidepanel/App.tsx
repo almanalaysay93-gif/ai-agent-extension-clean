@@ -65,58 +65,102 @@ function App() {
   const [fetchingContext, setFetchingContext] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [listening, setListening] = useState(false);
+  const [dragging, setDragging] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const draftRef = useRef('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const dictationRef = useRef<Dictation | null>(null);
   // Text that was already committed when dictation started, so interim
   // results replace each other instead of stacking up in the box.
   const dictationBaseRef = useRef('');
+  // The last value dictation itself wrote. If the box no longer matches it,
+  // the user typed while the mic was on, and their edit becomes the new base.
+  const dictationWroteRef = useRef('');
+  const attachmentsRef = useRef<Attachment[]>([]);
 
   useEffect(() => {
     draftRef.current = input;
   }, [input]);
 
-  const setDraft = useCallback((text: string) => {
-    setInput(text);
-    draftRef.current = text;
+  /** Keeps the auto-grow height in sync when the value is set from code. */
+  const resizeTextarea = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
   }, []);
+
+  const setDraft = useCallback(
+    (text: string) => {
+      setInput(text);
+      draftRef.current = text;
+      // Height is driven by the input handler during typing; dictation and
+      // clearing bypass it, so resize on the next frame once React has painted.
+      requestAnimationFrame(resizeTextarea);
+    },
+    [resizeTextarea],
+  );
+
+  /**
+   * Mirrors the attachment list synchronously. State updates are batched, so
+   * two quick picks would both read the same stale count and slip past the
+   * cap; the ref is current the moment it is written.
+   */
+  const applyAttachments = useCallback(
+    (next: (current: Attachment[]) => Attachment[]) => {
+      attachmentsRef.current = next(attachmentsRef.current);
+      setAttachments(attachmentsRef.current);
+    },
+    [],
+  );
 
   const addFiles = useCallback(
     async (files: FileList | File[]) => {
       const picked = [...files];
       if (picked.length === 0) return;
-      const room = MAX_ATTACHMENTS - attachments.length;
-      if (room <= 0) {
-        setError(`You can attach at most ${MAX_ATTACHMENTS} files per message.`);
-        return;
-      }
-      const accepted: Attachment[] = [];
-      for (const file of picked.slice(0, room)) {
+
+      const read: Attachment[] = [];
+      for (const file of picked) {
         try {
-          accepted.push(await readAttachment(file));
+          read.push(await readAttachment(file));
         } catch (err) {
           setError(err instanceof Error ? err.message : String(err));
         }
       }
-      if (accepted.length > 0) {
-        setAttachments((current) => [...current, ...accepted]);
+      if (read.length === 0) return;
+
+      const room = Math.max(0, MAX_ATTACHMENTS - attachmentsRef.current.length);
+      const overflow = read.length - Math.min(read.length, room);
+      if (room > 0) {
+        applyAttachments((current) => [...current, ...read.slice(0, room)]);
+      }
+      if (overflow > 0) {
+        setError(
+          `Only ${MAX_ATTACHMENTS} files fit in one message — ${overflow} were not attached.`,
+        );
       }
     },
-    [attachments.length],
+    [applyAttachments],
   );
 
   const removeAttachment = (index: number) =>
-    setAttachments((current) => current.filter((_, i) => i !== index));
+    applyAttachments((current) => current.filter((_, i) => i !== index));
 
   const toggleDictation = () => {
     if (!dictationRef.current) {
       dictationRef.current = createDictation({
         onTranscript: (text, isFinal) => {
+          // Respect edits made while the mic is on: if the box differs from
+          // what dictation last wrote, the user typed, so start from theirs.
+          if (draftRef.current !== dictationWroteRef.current) {
+            dictationBaseRef.current = draftRef.current.trim();
+          }
           const base = dictationBaseRef.current;
           const joined = base ? `${base} ${text}` : text;
           setDraft(joined);
+          dictationWroteRef.current = joined;
           if (isFinal) dictationBaseRef.current = joined;
         },
         onError: (message) => setError(message),
@@ -134,6 +178,7 @@ function App() {
     }
     setError(null);
     dictationBaseRef.current = draftRef.current.trim();
+    dictationWroteRef.current = draftRef.current;
     void dictation.start();
   };
 
@@ -252,7 +297,7 @@ function App() {
       type: 'SEND_MESSAGE',
       payload: { text, ...(attachments.length > 0 ? { attachments } : {}) },
     });
-    setAttachments([]);
+    applyAttachments(() => []);
   };
 
   const handleStop = () => send({ type: 'STOP' });
@@ -500,7 +545,30 @@ function App() {
           }}
         />
         <form onSubmit={handleSubmit} style={{ display: 'contents' }}>
-          <div className="ms-composer">
+          <div
+            className={`ms-composer ${dragging ? 'ms-composer-dragging' : ''}`}
+            // A drop only fires when dragover is cancelled, so the whole
+            // composer opts in — dropping anywhere on it attaches the files.
+            onDragOver={(e) => {
+              if (e.dataTransfer.types.includes('Files')) {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'copy';
+                if (!dragging) setDragging(true);
+              }
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+                setDragging(false);
+              }
+            }}
+            onDrop={(e) => {
+              setDragging(false);
+              if (e.dataTransfer.files.length > 0) {
+                e.preventDefault();
+                void addFiles(e.dataTransfer.files);
+              }
+            }}
+          >
             <button
               type="button"
               className="ms-icon-btn"
@@ -518,18 +586,13 @@ function App() {
               <Mic className="h-3.5 w-3.5" />
             </button>
             <textarea
+              ref={textareaRef}
               value={input}
               onPaste={(e) => {
                 const files = [...e.clipboardData.files];
                 if (files.length > 0) {
                   e.preventDefault();
                   void addFiles(files);
-                }
-              }}
-              onDrop={(e) => {
-                if (e.dataTransfer.files.length > 0) {
-                  e.preventDefault();
-                  void addFiles(e.dataTransfer.files);
                 }
               }}
               onChange={(e) => {
